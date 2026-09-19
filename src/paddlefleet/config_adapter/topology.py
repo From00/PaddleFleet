@@ -19,6 +19,28 @@ from __future__ import annotations
 from .utils import multi_lcm
 
 
+def min_valid_cards(tp, pp, ep, cp, sep=1, cards_per_node=8):
+    """Smallest legal GPU count for these parallel degrees.
+
+    Every legal card count is an integer multiple of this minimum, so it
+    doubles as the unit for deriving a target scale (see
+    ``ConfigAdapter._resolve_target_cards``).
+
+    Returns ``None`` when the dims violate a card-count-independent rule
+    (C3 or C5): no card count can rescue those.
+    """
+    if ep > 1 and ep % (tp * sep) != 0:
+        return None
+    if sep > 1 and cp > 1:
+        return None
+    factors = [tp * sep * pp, cards_per_node]
+    if ep > 1:
+        factors.append(pp * ep)
+    if cp > 1:
+        factors.append(tp * sep * pp * cp)
+    return multi_lcm(*factors)
+
+
 class TopologyValidator:
     """Validates Fleet communication-group constraints.
 
@@ -120,16 +142,11 @@ class TopologyValidator:
         (C3 or C5): no target scale can rescue those, so offering "legal"
         node counts would be misleading.
         """
-        if ep > 1 and ep % (tp * sep) != 0:
+        min_unit = min_valid_cards(
+            tp, pp, ep, cp, sep, cards_per_node=self.cards_per_node
+        )
+        if min_unit is None:
             return []
-        if sep > 1 and cp > 1:
-            return []
-        factors = [tp * sep * pp, self.cards_per_node]
-        if ep > 1:
-            factors.append(pp * ep)
-        if cp > 1:
-            factors.append(tp * sep * pp * cp)
-        min_unit = multi_lcm(*factors)
 
         max_cards = max_nodes * self.cards_per_node
         suggestions = [
