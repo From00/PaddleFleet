@@ -2285,5 +2285,82 @@ max_steps: 100
         self.assertEqual(out["context_parallel_size"], 4)
 
 
+class TestCpNeverShrinks(ConfigAdapterTestBase):
+    """CP is frozen even under --test-accuracy; the diagnostic explains why.
+
+    Shrinking CP only works if ``max_seq_length`` shrinks with it, which
+    changes what the run measures and makes pre-packed datasets unreadable, so
+    it stays an explicit ``--scale-seq-length`` decision.
+    """
+
+    #: dsv4-flash shape: 16 nodes / 128 cards, TP1 PP8 EP16 CP16, 128k seq.
+    #: At 8 cards sharding = 8/PP <= 4 < 16 = CP, so C4 has no solution for
+    #: any (EP, PP) pair -- CP is the sole blocker.
+    DSV4_YAML = """\
+model_name_or_path: ./model_dir
+max_seq_length: 131072
+global_batch_size: 8
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+sharding_parallel_size: 16
+data_parallel_size: 1
+tensor_model_parallel_size: 1
+expert_model_parallel_size: 16
+pipeline_model_parallel_size: 8
+context_parallel_size: 16
+num_empty_layers_add_in_head: 0
+num_empty_layers_add_in_tail: 5
+max_steps: 100
+"""
+
+    DSV4_JSON = {
+        "num_hidden_layers": 43,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 6,
+        "first_k_dense_replace": 1,
+        "num_nextn_predict_layers": 1,
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.write_yaml(self.DSV4_YAML)
+        self.write_json(self.DSV4_JSON)
+
+    def test_a_large_cp_blocks_the_shrink_and_says_so(self):
+        ok, message = self.adapt(1, test_accuracy=True)
+        self.assertFalse(ok, message)
+        self.assertIn("CP=16 不参与自动缩容", message)
+        # sharding maxes out at 8/(1*1*2) = 4 with PP at its floor.
+        self.assertIn("sharding 最大只有 4", message)
+        self.assertIn("--scale-seq-length", message)
+
+    def test_the_c4_rejections_survive_the_detail_truncation(self):
+        """C4 lines must not be crowded out by model-structure rejections."""
+        ok, message = self.adapt(1, test_accuracy=True)
+        self.assertFalse(ok, message)
+        self.assertIn("候选淘汰明细", message)
+        self.assertIn("C4 不满足", message)
+
+    def test_a_smaller_cp_needs_no_excuse(self):
+        """CP=2 divides every reachable sharding, so it never blocks."""
+        self.write_yaml(
+            self.DSV4_YAML.replace(
+                "context_parallel_size: 16", "context_parallel_size: 2"
+            )
+        )
+        ok, message = self.adapt(1, test_accuracy=True)
+        self.assertNotIn("不参与自动缩容", message)
+
+    def test_scale_seq_length_is_the_way_to_move_cp(self):
+        """The explicit escape hatch still works and shrinks CP with the seq."""
+        ok, message = self.adapt(
+            1, test_accuracy=True, scale_seq_length=131072 // 8
+        )
+        self.assertTrue(ok, message)
+        out = self.load_output_yaml(8)
+        self.assertEqual(out["max_seq_length"], 16384)
+        self.assertEqual(out["context_parallel_size"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

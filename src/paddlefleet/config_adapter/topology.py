@@ -31,6 +31,15 @@ class TopologyValidator:
       C4: sharding % CP == 0       -> cp_sharding is a positive integer
       C5: not (SEP > 1 and CP > 1) -> "sep parallel and context parallel
           cannot be used together" (PaddleFormers training_args.py)
+
+    C2 and C4 constrain the *same* block of sharding ranks, read two different
+    ways -- ``Topology`` itself has neither a cp nor an ep axis, only
+    ``["dp", "pp", "sharding", "mp", "sep"]``.  The MoE view factors it as
+    ``sharding = moe_sharding * dense_sharding`` with
+    ``dense_sharding = EP / (TP * SEP)``, the data view as
+    ``sharding = dataset_world_size * CP``.  Both factorizations have to come
+    out integral, so the two conditions cannot be merged into one: they are
+    different divisors of the same number.
     """
 
     def __init__(self, target_cards, cards_per_node=8):
