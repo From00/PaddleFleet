@@ -645,7 +645,18 @@ class ConfigAdapter:
                 f"（{min_planned} 卡）推导所需规模；若源作业实际跑在下限的整数"
                 f"倍上，请改用 --target-nodes 显式指定"
             )
-        elif min_before is None or orig_cards % min_before != 0:
+        elif min_before is None:
+            # The source dims violate C3/C5, so they have no topological floor
+            # to measure headroom against -- while the converted dims do (a
+            # --scale-seq-length that drops CP to 1 next to SEP>1 gets here).
+            # Naming a floor of "None" would be worse than not naming one.
+            warning = (
+                f"未指定 --target-nodes，且源并行度组合违反与卡数无关的约束"
+                f"（C3/C5，源配置本身跑不起来），源卡数 {orig_cards} 不能作为"
+                f"推导基准；转换后的组合已合法，按其拓扑下限"
+                f"（{min_planned} 卡）推导所需规模"
+            )
+        elif orig_cards % min_before != 0:
             warning = (
                 f"未指定 --target-nodes 且源卡数 {orig_cards} 不是源并行度"
                 f"拓扑下限 {min_before} 的整数倍（源 YAML 本身就不自洽），"

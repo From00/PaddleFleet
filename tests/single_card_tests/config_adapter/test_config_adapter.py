@@ -2182,6 +2182,23 @@ max_steps: 100
         self.assertIn("C3", message)
         self.assertFalse(self.output_dir.exists())
 
+    def test_an_illegal_source_floor_is_not_named(self):
+        # SEP=2 next to CP=2 violates C5, so the *source* dims have no
+        # topological floor at all, while the converted ones do:
+        # --scale-seq-length drops CP to 1 and makes them legal.  The slack
+        # fallback must say that instead of interpolating the missing floor
+        # into the warning as the literal "None".
+        self.write_yaml(
+            self.SLACK_YAML.replace(
+                "context_parallel_size: 1",
+                "context_parallel_size: 2\nsep_parallel_size: 2",
+            )
+        )
+        ok, message = self.adapt(None, scale_seq_length=4096)
+        self.assertTrue(ok, message)
+        self.assertIn("C3/C5", message)
+        self.assertNotIn("None", message)
+
     def test_an_explicit_target_still_wins(self):
         # Regression guard: --target-nodes keeps deciding the scale outright,
         # and REQUIRED_* simply echoes it.
