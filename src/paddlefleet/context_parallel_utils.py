@@ -487,87 +487,49 @@ def all_gather_contiguous(input_tensor, group=None, axis=0):
         return paddle.concat(tensor_list, axis=axis)
 
 
-def reduce_scatter_contiguous(input_tensor, axis, group=None, mode=None):
-    """Contiguous reduce-scatter: reduce_scatter for axis=0, alltoall+sum otherwise.
-
-    ``mode`` guards the axis != 0 fast path, which is valid exactly when the
-    forward was a rank-order contiguous concat. Pass the caller's
-    cp_balance_mode so a future non-contiguous mode cannot reach the fast path
-    and silently compute a wrong gradient.
-    """
+def reduce_scatter_contiguous(input_tensor, axis, group=None):
+    """Reduce-scatter the gradient of a contiguous rank-order all_gather."""
     if group is None:
         hcg = fleet.get_hybrid_communicate_group()
         group = hcg.get_context_parallel_group()
     nranks = group.nranks
     if nranks == 1:
         return input_tensor.clone()
-    if axis == 0:
-        output_shape = list(input_tensor.shape)
-        output_shape[0] //= nranks
-        output = paddle.empty(shape=output_shape, dtype=input_tensor.dtype)
+    assert int(input_tensor.shape[axis]) % nranks == 0, (
+        f"reduce_scatter_contiguous: shape[{axis}]={input_tensor.shape[axis]} "
+        f"is not divisible by context parallel size {nranks}"
+    )
+    # Dims before ``axis`` all 1: dropping them keeps rank order, so a single
+    # reduce_scatter does it. A leading dim > 1 interleaves ranks on the flat
+    # view and would sum the wrong terms, hence the fall-through.
+    # fp32 on the wire because NCCL reduces in the transfer dtype, while the
+    # sum(0) below accumulates in fp32 whatever the input dtype is.
+    if list(input_tensor.shape[:axis]) == [1] * axis:
+        out_shape = list(input_tensor.shape)
+        out_shape[axis] //= nranks
+        flat = input_tensor.reshape(input_tensor.shape[axis:]).cast("float32")
+        rs_out = paddle.empty(shape=out_shape[axis:], dtype="float32")
         dist.stream.reduce_scatter(
-            output,
-            input_tensor.contiguous(),
+            rs_out,
+            flat.contiguous(),
             op=dist.ReduceOp.SUM,
             group=group,
             use_calc_stream=True,
         )
-        return output
-    else:
-        # Mirror of the all_gather_contiguous fast path: when every dim before
-        # ``axis`` is 1, the forward gather is just a rank-order concat along the
-        # flat leading axis, so the backward is exactly one axis=0 reduce_scatter
-        # on the flat view -- no alltoall + stack + fp32 + sum(0), whose peak is
-        # about 6x the gradient itself. Still reduce in fp32: accumulating nranks
-        # terms in bf16 is an order of magnitude less accurate than the slow path.
-        #
-        # This is mathematically the same sum but not bit-identical: NCCL picks
-        # the reduction order from the topology while the slow path adds the
-        # nranks terms in rank order inside one sum(0) kernel, and fp32 addition
-        # is not associative. Measured on 8 ranks: max_abs_diff 1.9e-6 / relative
-        # 1.8e-7 for fp32, exactly 0 for bf16 (the difference falls below the
-        # mantissa). The dims-before-axis check is what makes it safe -- with a
-        # non-1 leading dim the flat view interleaves ranks and the sum would be
-        # wrong, not merely reordered.
-        if (
-            list(input_tensor.shape[:axis]) == [1] * axis
-            and int(input_tensor.shape[axis]) % nranks == 0
-        ):
-            # The equivalence only holds for a rank-order contiguous concat
-            # forward. Callers that cannot say so must not take this path.
-            assert mode is None or str(mode).startswith("contiguous"), (
-                "reduce_scatter_contiguous fast path assumes a contiguous "
-                f"rank-order all_gather forward, got mode={mode!r}"
-            )
-            flat_shape = [-1] + list(input_tensor.shape[axis + 1 :])
-            flat = input_tensor.reshape(flat_shape)
-            rs_shape = list(flat.shape)
-            rs_shape[0] //= nranks
-            final_shape = list(input_tensor.shape)
-            final_shape[axis] //= nranks
-            rs_out = paddle.empty(shape=rs_shape, dtype="float32")
-            dist.stream.reduce_scatter(
-                rs_out,
-                flat.cast("float32").contiguous(),
-                op=dist.ReduceOp.SUM,
-                group=group,
-                use_calc_stream=True,
-            )
-            return rs_out.reshape(final_shape).cast(input_tensor.dtype)
-        chunks = paddle.split(input_tensor, nranks, axis=axis)
-        bufs = [
-            paddle.empty(chunks[0].shape, dtype=input_tensor.dtype)
-            for _ in range(nranks)
-        ]
-        dist.stream.alltoall(
-            bufs,
-            [c.contiguous() for c in chunks],
-            group=group,
-            use_calc_stream=True,
-        )
-        return (
-            paddle.stack(bufs).cast("float32").sum(0).cast(input_tensor.dtype)
-        )
+        return rs_out.reshape(out_shape).cast(input_tensor.dtype)
+
+    chunks = paddle.split(input_tensor, nranks, axis=axis)
+    bufs = [
+        paddle.empty(chunks[0].shape, dtype=input_tensor.dtype)
+        for _ in range(nranks)
+    ]
+    dist.stream.alltoall(
+        bufs,
+        [c.contiguous() for c in chunks],
+        group=group,
+        use_calc_stream=True,
+    )
+    return paddle.stack(bufs).cast("float32").sum(0).cast(input_tensor.dtype)
 
 
 class ContextParallelScatterOp(PyLayer):
@@ -667,7 +629,7 @@ class ContextParallelAllGatherOp(PyLayer):
     def backward(ctx, grad_output):
         if ctx.mode.startswith("contiguous"):
             return reduce_scatter_contiguous(
-                grad_output, axis=ctx.axis, group=ctx.group, mode=ctx.mode
+                grad_output, axis=ctx.axis, group=ctx.group
             )
         return reduce_scatter_any_axis_balance(
             grad_output, axis=ctx.axis, group=ctx.group
@@ -1015,10 +977,10 @@ def cp_flashmask_allgatherkv_balance_backward(
         )
     elif mode == "contiguous_allgather":
         key_grad = reduce_scatter_contiguous(
-            key_grad_gathered, axis=1, group=group, mode=mode
+            key_grad_gathered, axis=1, group=group
         )
         value_grad = reduce_scatter_contiguous(
-            value_grad_gathered, axis=1, group=group, mode=mode
+            value_grad_gathered, axis=1, group=group
         )
     else:
         raise ValueError(f"Unsupported FlashMask context parallel mode: {mode}")
