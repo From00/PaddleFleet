@@ -23,7 +23,7 @@ import os
 import sys
 
 _project_root = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 sys.path.insert(0, os.path.join(_project_root, "src"))
 
